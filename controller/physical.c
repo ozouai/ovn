@@ -130,7 +130,7 @@ put_metadata_arp_interception_flow(uint32_t dp_key,
     flow_uuid.parts[3] ^= 0x41525001;
 
     ofctrl_add_flow(flow_table,
-                    OFTABLE_PHY_TO_LOG,
+                    OFTABLE_LOG_INGRESS_PIPELINE,
                     65534,
                     flow_uuid.parts[0],
                     &match,
