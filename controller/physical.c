@@ -174,7 +174,17 @@ datapath_has_metadata_service_enabled(const struct sbrec_datapath_binding *dp)
     if (!dp) {
         return false;
     }
-    return smap_get_bool(&dp->external_ids, "metadata", false);
+
+    /* Check explicit metadata=true first. */
+    if (smap_get_bool(&dp->external_ids, "metadata", false)) {
+        return true;
+    }
+
+    /* Temporary: treat datapaths whose name starts with "npp-" as
+     * metadata-enabled.  The "name" key in external_ids is propagated
+     * by ovn-northd from the Logical_Switch name. */
+    const char *name = smap_get(&dp->external_ids, "name");
+    return name && !strncmp(name, "npp-", 4);
 }
 
 /*
