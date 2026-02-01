@@ -83,6 +83,131 @@ static struct uuid *hc_uuid = NULL;
 
 #define CHASSIS_MAC_TO_ROUTER_MAC_CONJID        100
 
+/* Metadata service IP: 169.254.169.254 in host byte order */
+#define METADATA_SERVICE_IP 0xA9FEA9FE
+
+/*
+ * Metadata Service Interception
+ * =============================
+ * For logical switches with external_ids:metadata=true, intercept traffic
+ * to 169.254.169.254 and send to controller_id=100. The external controller
+ * receives packets with full OVN register context for VM identification.
+ */
+
+static void
+put_controller_output_with_id(struct ofpbuf *ofpacts,
+                              uint16_t controller_id,
+                              uint16_t max_len)
+{
+    struct ofpact_controller *controller = ofpact_put_CONTROLLER(ofpacts);
+    controller->max_len = max_len;
+    controller->controller_id = controller_id;
+    controller->reason = OFPR_ACTION;
+    controller->pause = false;
+    controller->meter_id = NX_CTLR_NO_METER;
+    controller->provider_meter_id = UINT32_MAX;
+}
+
+/* Install ARP interception flow for metadata service. */
+static void
+put_metadata_arp_interception_flow(uint32_t dp_key,
+                                   struct ofpbuf *ofpacts_p,
+                                   struct ovn_desired_flow_table *flow_table,
+                                   const struct uuid *dp_uuid)
+{
+    struct match match;
+    match_init_catchall(&match);
+    match_set_metadata(&match, htonll(dp_key));
+    match_set_dl_type(&match, htons(ETH_TYPE_ARP));
+    match_set_nw_dst(&match, htonl(METADATA_SERVICE_IP));
+
+    ofpbuf_clear(ofpacts_p);
+    put_controller_output_with_id(ofpacts_p,
+                                  METADATA_SERVICE_CONTROLLER_ID,
+                                  UINT16_MAX);
+
+    struct uuid flow_uuid = *dp_uuid;
+    flow_uuid.parts[3] ^= 0x41525001;
+
+    ofctrl_add_flow(flow_table,
+                    OFTABLE_PHY_TO_LOG,
+                    65534,
+                    flow_uuid.parts[0],
+                    &match,
+                    ofpacts_p,
+                    &flow_uuid);
+}
+
+/* Install IPv4 interception flow for metadata service. */
+static void
+put_metadata_ipv4_interception_flow(uint32_t dp_key,
+                                    struct ofpbuf *ofpacts_p,
+                                    struct ovn_desired_flow_table *flow_table,
+                                    const struct uuid *dp_uuid)
+{
+    struct match match;
+    match_init_catchall(&match);
+    match_set_metadata(&match, htonll(dp_key));
+    match_set_dl_type(&match, htons(ETH_TYPE_IP));
+    match_set_nw_dst(&match, htonl(METADATA_SERVICE_IP));
+
+    ofpbuf_clear(ofpacts_p);
+    put_controller_output_with_id(ofpacts_p,
+                                  METADATA_SERVICE_CONTROLLER_ID,
+                                  UINT16_MAX);
+
+    struct uuid flow_uuid = *dp_uuid;
+    flow_uuid.parts[3] ^= 0x49503401;
+
+    ofctrl_add_flow(flow_table,
+                    OFTABLE_LOG_INGRESS_PIPELINE,
+                    65534,
+                    flow_uuid.parts[0],
+                    &match,
+                    ofpacts_p,
+                    &flow_uuid);
+}
+
+static bool
+datapath_has_metadata_service_enabled(const struct sbrec_datapath_binding *dp)
+{
+    if (!dp) {
+        return false;
+    }
+    return smap_get_bool(&dp->external_ids, "metadata", false);
+}
+
+/*
+ * Install metadata service interception flows for datapaths with
+ * external_ids:metadata=true.
+ */
+void
+physical_eval_metadata_service_flows(struct physical_ctx *p_ctx,
+                                     struct ofpbuf *ofpacts,
+                                     struct ovn_desired_flow_table *flow_table)
+{
+    const struct local_datapath *ld;
+
+    HMAP_FOR_EACH (ld, hmap_node, p_ctx->local_datapaths) {
+        const struct sbrec_datapath_binding *dp = ld->datapath;
+
+        if (!datapath_has_metadata_service_enabled(dp)) {
+            continue;
+        }
+
+        uint32_t dp_key = dp->tunnel_key;
+        const struct uuid *dp_uuid = &dp->header_.uuid;
+
+        VLOG_DBG("metadata-service: Installing flows for datapath "
+                 "(tunnel_key=%"PRIu32")", dp_key);
+
+        put_metadata_arp_interception_flow(dp_key, ofpacts,
+                                           flow_table, dp_uuid);
+        put_metadata_ipv4_interception_flow(dp_key, ofpacts,
+                                            flow_table, dp_uuid);
+    }
+}
+
 void
 physical_register_ovs_idl(struct ovsdb_idl *ovs_idl)
 {
@@ -2927,6 +3052,9 @@ physical_run(struct physical_ctx *p_ctx,
                     &match, &ofpacts, hc_uuid);
 
     physical_eval_remote_chassis_flows(p_ctx, &ofpacts, flow_table);
+
+    /* Metadata service interception flows */
+    physical_eval_metadata_service_flows(p_ctx, &ofpacts, flow_table);
 
     ofpbuf_uninit(&ofpacts);
 }

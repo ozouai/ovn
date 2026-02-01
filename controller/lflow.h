@@ -101,6 +101,8 @@ struct uuid;
 #define OFTABLE_FLOOD_REMOTE_CHASSIS     84
 #define OFTABLE_CT_STATE_SAVE            85
 
+/* Metadata service uses controller_id 100 for external controller */
+#define METADATA_SERVICE_CONTROLLER_ID 100
 
 struct lflow_ctx_in {
     struct ovsdb_idl_index *sbrec_multicast_group_by_name_datapath;
