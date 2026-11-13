@@ -1,0 +1,59 @@
+# OVN/OVS fork build, the cache-worthy centerpiece of the Bazel migration.
+#
+# Source of truth: bazel/ovn-overlay/ (copied into the `ovn` git submodule
+# (ozouai/ovn) by bazel/ovn-overlay/install.sh; they show as untracked there).
+#
+# Produces //ovn:ovn_fork_tar == ovn-fork.tar.gz, byte-compatible with the layout
+# that test-harness/provision/ovn-fork-deploy.sh extracts at / (usr/local/...).
+
+load("@rules_foreign_cc//foreign_cc:defs.bzl", "configure_make")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+
+# The whole fork tree (OVN + nested ovs/), minus VCS metadata. The submodule's
+# .git is a *file* (gitlink), so exclude both the file and any dir form.
+filegroup(
+    name = "ovn_tree",
+    srcs = glob(
+        ["**"],
+        exclude = [
+            ".git",
+            ".git/**",
+            "ovs/.git",
+            "ovs/.git/**",
+            "BUILD.bazel",
+        ],
+    ),
+)
+
+# Single combined target: OVS + OVN built in one sandbox, OVS in-source (see
+# nube_build_ovn.sh for why). targets=[] => rules_foreign_cc runs only our driver
+# (the "configure" step), which does its own make install into the prefix.
+configure_make(
+    name = "ovn_fork",
+    lib_source = ":ovn_tree",
+    configure_in_place = True,
+    configure_command = "nube_build_ovn.sh",
+    targets = [],
+    # We capture the whole install tree via out_data_dirs. out_headers_only
+    # suppresses configure_make's synthetic default "<name>.a" output, which
+    # would otherwise collide with the captured lib/ directory. (It does not
+    # mean the build is headers-only; it only changes which outputs are declared.)
+    out_headers_only = True,
+    out_data_dirs = [
+        "bin",
+        "lib",
+        "share",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# Re-root the install tree under usr/local to match the deploy contract:
+#   usr/local/bin/ovn-northd, usr/local/lib/lib*.so*, usr/local/share/ovn/...
+pkg_tar(
+    name = "ovn_fork_tar",
+    srcs = [":ovn_fork"],
+    package_dir = "usr/local",
+    extension = "tar.gz",
+    out = "ovn-fork.tar.gz",
+    visibility = ["//visibility:public"],
+)
