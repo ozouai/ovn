@@ -298,6 +298,22 @@
         The default value is considered false if this option is not defined.
       </dd>
 
+      <dt><code>external_ids:ovn-ofctrl-flow-check-interval</code></dt>
+      <dd>
+        How often, in milliseconds, <code>ovn-controller</code> checks that
+        the integration bridge still has the flows it installed.  Open
+        vSwitch deletes all of a bridge's flows when the bridge gains its
+        first OpenFlow controller or loses its last one, and
+        <code>ovs-ofctl del-flows</code> does the same; neither closes
+        <code>ovn-controller</code>'s connection, so without this check the
+        bridge would forward nothing until <code>ovn-controller</code> was
+        restarted.  The check asks the switch for one installed flow.  When
+        it is missing, <code>ovn-controller</code> logs a warning and
+        reconnects, which installs all flows again as after a restart of
+        <code>ovs-vswitchd</code>.  The default is 2000.  0 disables the
+        check.
+      </dd>
+
       <dt><code>external_ids:ovn-ofctrl-wait-before-clear</code></dt>
       <dd>
         The time, in milliseconds, to wait before clearing flows in OVS after

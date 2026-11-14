@@ -2374,6 +2374,90 @@ OVS_WAIT_UNTIL([
 OVN_CLEANUP([hv1])
 AT_CLEANUP
 
+AT_SETUP([ovn-controller - flows deleted from outside are reinstalled])
+
+ovn_start
+
+net_add n1
+sim_add hv1
+as hv1
+check ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.1
+check ovs-vsctl -- add-port br-int hv1-vif1 -- \
+    set interface hv1-vif1 external-ids:iface-id=ls1-lp1
+
+check ovn-nbctl ls-add ls1
+check ovn-nbctl lsp-add ls1 ls1-lp1 \
+-- lsp-set-addresses ls1-lp1 "f0:00:00:00:00:01 10.1.2.3"
+check ovn-nbctl lb-add lb1 1.1.1.1 10.1.2.3 \
+-- ls-lb-add ls1 lb1
+wait_for_ports_up
+check ovn-nbctl --wait=hv sync
+
+count_flows() {
+    ovs-ofctl dump-flows br-int | grep -c table=
+}
+dump_flows() {
+    ovs-ofctl dump-flows br-int | grep table= | \
+        sed 's/ duration=[[^ ]]*//; s/ n_packets=[[^ ]]*//;
+             s/ n_bytes=[[^ ]]*//; s/ idle_age=[[^ ]]*//;
+             s/ hard_age=[[^ ]]*//' | sort
+}
+lost() {
+    grep -c "no longer has a flow" hv1/ovn-controller.log
+}
+
+n=$(count_flows)
+AT_CHECK([test $n -gt 20])
+dump_flows > flows-before
+
+# Nothing is lost while nothing happens.
+sleep 5
+AT_CHECK([lost], [1], [0
+])
+
+# Someone deletes the flows.
+check ovs-ofctl del-flows br-int
+OVS_WAIT_UNTIL([test $(count_flows) = $n])
+AT_CHECK([lost], [0], [1
+])
+dump_flows > flows-after
+AT_CHECK([diff flows-before flows-after])
+
+# The bridge gains its first OpenFlow controller: Open vSwitch deletes
+# every flow.  Nothing needs to listen there.
+check ovs-vsctl set-controller br-int tcp:127.0.0.1:1
+OVS_WAIT_UNTIL([test $(lost) = 2])
+OVS_WAIT_UNTIL([test $(count_flows) = $n])
+
+# And loses its last.
+check ovs-vsctl del-controller br-int
+OVS_WAIT_UNTIL([test $(lost) = 3])
+OVS_WAIT_UNTIL([test $(count_flows) = $n])
+dump_flows > flows-after
+AT_CHECK([diff flows-before flows-after])
+
+# New flows still get installed afterwards.
+check ovn-nbctl lsp-add ls1 ls1-lp2 \
+-- lsp-set-addresses ls1-lp2 "f0:00:00:00:00:02 10.1.2.4"
+check ovn-nbctl --wait=hv sync
+AT_CHECK([test $(count_flows) -gt $n])
+
+# With the check disabled, they stay deleted.
+check ovs-vsctl set open . external_ids:ovn-ofctrl-flow-check-interval=0
+OVS_WAIT_UNTIL([grep -q "ofctrl-flow-check-interval is now 0" hv1/ovn-controller.log])
+check ovs-ofctl del-flows br-int
+sleep 6
+AT_CHECK([count_flows], [1], [0
+])
+AT_CHECK([lost], [0], [3
+])
+
+OVN_CLEANUP([hv1
+/no longer has a flow/d
+/connection failed (Connection refused)/d])
+AT_CLEANUP
+
 AT_SETUP([ovn-controller - ofctrl wait before clearing flows])
 
 ovn_start

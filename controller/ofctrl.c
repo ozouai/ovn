@@ -60,6 +60,7 @@
 VLOG_DEFINE_THIS_MODULE(ofctrl);
 
 COVERAGE_DEFINE(ofctrl_msg_too_long);
+COVERAGE_DEFINE(ofctrl_flows_lost);
 
 /* An OpenFlow flow. */
 struct ovn_flow {
@@ -405,6 +406,48 @@ static enum mf_field_id mff_ovn_geneve;
  * (e.g. after OVS restart). */
 static bool ofctrl_initial_clear;
 
+/* Detecting that the switch lost our flows.
+ *
+ * Open vSwitch deletes every flow of a bridge when the bridge gains its first
+ * OpenFlow controller or loses its last one (ofproto/connmgr.c), and anyone
+ * with access to the bridge can delete them as well ("ovs-ofctl del-flows").
+ * Neither closes our connection, so nothing tells us: we go on believing the
+ * flows are installed, the bridge forwards nothing, and every VM on the
+ * chassis is cut off until ovn-controller is restarted.
+ *
+ * So in S_UPDATE_FLOWS we ask, every 'flow_check_interval' ms, how many flows
+ * the switch has that match one flow we installed (an aggregate statistics
+ * request, restricted to that flow's table and match).  A flow we still
+ * consider installed when the reply arrives, and that the switch does not
+ * have, means the flows were lost: we reconnect, which reinstalls everything
+ * the way it is done after an ovs-vswitchd restart.
+ *
+ * The probed flow is one that was installed before the request was sent (its
+ * flow mod precedes the request on the connection) and has not been removed
+ * since (it is still in the installed table when the reply is handled), so a
+ * flow we are adding or removing ourselves is never mistaken for a lost
+ * one. */
+#define FLOW_CHECK_DEFAULT_INTERVAL_MS 2000
+#define FLOW_CHECK_REPLY_TIMEOUT_MS 10000
+
+/* How often to probe, in ms; 0 never does.  Read from
+ * external_ids:ovn-ofctrl-flow-check-interval. */
+static unsigned int flow_check_interval = FLOW_CHECK_DEFAULT_INTERVAL_MS;
+/* When to send the next probe. */
+static long long int flow_check_next;
+/* The outstanding probe: its transaction ID, when it gives up waiting, and
+ * the key of the flow it asks about.  'flow_check_pending' is false when
+ * there is none. */
+static bool flow_check_pending;
+static ovs_be32 flow_check_xid;
+static long long int flow_check_expire;
+static struct ovn_flow flow_check_key;
+/* Set if the switch answered a probe with an error: it cannot be probed, and
+ * we stop asking until the next reconnection. */
+static bool flow_check_unsupported;
+
+static void flow_check_reset(void);
+
 static ovs_be32 queue_msg(struct ofpbuf *);
 
 static struct ofpbuf *encode_flow_mod(struct ofputil_flow_mod *);
@@ -443,6 +486,8 @@ ofctrl_init(struct ovn_extend_table *group_table,
 static void
 run_S_NEW(void)
 {
+    flow_check_reset();
+    flow_check_unsupported = false;
     struct ofpbuf *buf = ofpraw_alloc(OFPRAW_NXT_TLV_TABLE_REQUEST,
                                       rconn_get_version(swconn), 0);
     xid = queue_msg(buf);
@@ -722,11 +767,130 @@ recv_S_CLEAR_FLOWS(const struct ofp_header *oh, enum ofptype type,
  * drops. */
 
 static void
+flow_check_reset(void)
+{
+    if (flow_check_pending) {
+        minimatch_destroy(&flow_check_key.match);
+        flow_check_pending = false;
+    }
+    flow_check_next = time_msec() + flow_check_interval;
+}
+
+/* Sends a probe for one installed flow, if it is time for one. */
+static void
+flow_check_run(void)
+{
+    if (!flow_check_interval || flow_check_unsupported) {
+        return;
+    }
+
+    long long int now = time_msec();
+    if (flow_check_pending) {
+        if (now < flow_check_expire) {
+            return;
+        }
+        /* The reply never came.  Ask again. */
+        flow_check_reset();
+        flow_check_next = now;
+    }
+    if (now < flow_check_next) {
+        return;
+    }
+
+    /* Any flow will do.  Physical flows come first: there are few of them
+     * and they change least. */
+    struct hmap *tables[] = { &installed_pflows, &installed_lflows };
+    const struct installed_flow *probe = NULL;
+    for (size_t i = 0; i < ARRAY_SIZE(tables) && !probe; i++) {
+        struct hmap_node *node = hmap_first(tables[i]);
+        if (node) {
+            probe = CONTAINER_OF(node, struct installed_flow,
+                                 match_hmap_node);
+        }
+    }
+    if (!probe) {
+        /* Nothing is installed, so nothing can be lost. */
+        flow_check_next = now + flow_check_interval;
+        return;
+    }
+
+    struct ofputil_flow_stats_request fsr = {
+        .aggregate = true,
+        .table_id = probe->flow.table_id,
+        .out_port = OFPP_ANY,
+        .out_group = OFPG_ANY,
+    };
+    minimatch_expand(&probe->flow.match, &fsr.match);
+
+    flow_check_key.table_id = probe->flow.table_id;
+    flow_check_key.priority = probe->flow.priority;
+    flow_check_key.hash = probe->flow.hash;
+    minimatch_clone(&flow_check_key.match, &probe->flow.match);
+    flow_check_pending = true;
+    flow_check_expire = now + FLOW_CHECK_REPLY_TIMEOUT_MS;
+    flow_check_xid = queue_msg(
+        ofputil_encode_flow_stats_request(&fsr, OFPUTIL_P_OF15_OXM));
+}
+
+/* Handles a message that may be the answer to our probe.  Returns true if it
+ * was, whatever it said. */
+static bool
+flow_check_recv(const struct ofp_header *oh, enum ofptype type)
+{
+    if (!flow_check_pending || oh->xid != flow_check_xid) {
+        return false;
+    }
+
+    if (type == OFPTYPE_ERROR) {
+        /* Not a reason to reconnect, which is what an error means otherwise:
+         * that would be done again at every probe. */
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+        char *str = ofp_to_string(oh, ntohs(oh->length), NULL, NULL, 1);
+        VLOG_WARN_RL(&rl, "the switch refused the flow check (%s); lost "
+                     "flows will not be detected on this connection", str);
+        free(str);
+        flow_check_reset();
+        flow_check_unsupported = true;
+        return true;
+    }
+    if (type != OFPTYPE_AGGREGATE_STATS_REPLY) {
+        return false;
+    }
+
+    struct ofputil_aggregate_stats stats;
+    enum ofperr error = ofputil_decode_aggregate_stats_reply(&stats, oh);
+    bool still_ours = installed_flow_lookup(&flow_check_key,
+                                            &installed_pflows)
+                      || installed_flow_lookup(&flow_check_key,
+                                               &installed_lflows);
+    if (!error && !stats.flow_count && still_ours) {
+        struct ds str = DS_EMPTY_INITIALIZER;
+        minimatch_format(&flow_check_key.match, NULL, NULL, &str,
+                         OFP_DEFAULT_PRIORITY);
+        VLOG_WARN("the switch no longer has a flow that was installed "
+                  "(table %"PRIu8", priority %"PRIu16", match \"%s\"): "
+                  "its flows were deleted from outside, for example because "
+                  "the bridge gained or lost an OpenFlow controller.  "
+                  "Reinstalling all flows.", flow_check_key.table_id,
+                  flow_check_key.priority, ds_cstr(&str));
+        ds_destroy(&str);
+        COVERAGE_INC(ofctrl_flows_lost);
+        flow_check_reset();
+        /* Reconnecting clears the switch and installs everything again, as
+         * after a restart of ovs-vswitchd. */
+        rconn_reconnect(swconn);
+        return true;
+    }
+    flow_check_reset();
+    return true;
+}
+
+static void
 run_S_UPDATE_FLOWS(void)
 {
-    /* Nothing to do here.
-     *
-     * Being in this state enables ofctrl_put() to work, however. */
+    /* Being in this state enables ofctrl_put() to work.  Besides that, we
+     * only check that the switch still has what we installed. */
+    flow_check_run();
 }
 
 static void
@@ -769,6 +933,8 @@ recv_S_UPDATE_FLOWS(const struct ofp_header *oh, enum ofptype type,
     if (type == OFPTYPE_BARRIER_REPLY) {
         flow_updates_handle_barrier_reply(oh, pending_ct_zones);
         acl_ids_handle_barrier_reply(tracked_acl_ids, oh->xid);
+    } else if (flow_check_recv(oh, type)) {
+        /* The answer to our flow check. */
     } else if (!acl_ids_handle_non_barrier_reply(oh, type, tracked_acl_ids)) {
         ofctrl_recv(oh, type);
     }
@@ -832,6 +998,15 @@ ofctrl_run(const char *conn_target, int probe_interval,
                   _wait_before_clear_time, wait_before_clear_time);
         wait_before_clear_time = _wait_before_clear_time;
     }
+    unsigned int _flow_check_interval =
+        smap_get_uint(&cfg->external_ids, "ovn-ofctrl-flow-check-interval",
+                      FLOW_CHECK_DEFAULT_INTERVAL_MS);
+    if (_flow_check_interval != flow_check_interval) {
+        VLOG_INFO("ofctrl-flow-check-interval is now %u ms (was %u ms)",
+                  _flow_check_interval, flow_check_interval);
+        flow_check_interval = _flow_check_interval;
+        flow_check_reset();
+    }
 
     bool progress = true;
     for (int i = 0; progress && i < 50; i++) {
@@ -890,6 +1065,11 @@ ofctrl_wait(void)
 {
     rconn_run_wait(swconn);
     rconn_recv_wait(swconn);
+    if (state == S_UPDATE_FLOWS && flow_check_interval
+        && !flow_check_unsupported && rconn_is_connected(swconn)) {
+        poll_timer_wait_until(flow_check_pending
+                              ? flow_check_expire : flow_check_next);
+    }
 }
 
 void
