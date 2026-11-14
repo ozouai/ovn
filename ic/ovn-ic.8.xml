@@ -50,6 +50,56 @@
       passive connection method, as described in <code>ovsdb</code>(7).
     </p>
 
+    <h2>Restricting an Instance</h2>
+    <p>
+      Whoever can write to the interconnection databases can join any transit
+      switch in them, advertise any route onto it and choose the tunnel key of
+      its datapath.  When the other availability zone is not trusted that
+      far, give each one interconnection databases of its own and run one
+      <code>ovn-ic</code> per pair against the same OVN Northbound and
+      Southbound databases, each restricted with the options below.  They
+      come from the command line so that nothing in an interconnection
+      database can change them.
+    </p>
+    <dl>
+      <dt><code>--ic-instance=<var>name</var></code></dt>
+      <dd>
+        Names this <code>ovn-ic</code>.  It takes the Southbound lock
+        <code>ovn_ic_<var>name</var></code> instead of <code>ovn_ic</code>
+        (characters a lock name cannot have are replaced by underscores), so
+        several can be active at once.  It records <var>name</var> as
+        <code>ic-instance</code> in the <code>other_config</code> of the
+        transit switches and remote chassis it creates and in the
+        <code>external_ids</code> of the routes it learns, and it never
+        modifies or deletes one that carries a different name, or none.
+        Without this option <code>ovn-ic</code> owns exactly the ones that
+        carry no name.  When an instance is retired, what it created stays
+        until it is removed by hand.
+      </dd>
+      <dt><code>--ic-transit-switch=<var>name</var></code></dt>
+      <dd>
+        Serve only the transit switch <var>name</var>.  Any other transit
+        switch in the interconnection databases is ignored: no logical switch
+        is created for it and its datapath is left alone.
+      </dd>
+      <dt><code>--ic-ts-key=<var>key</var></code></dt>
+      <dd>
+        The tunnel key of that transit switch's datapath, from the range
+        reserved for transit switches.  It replaces whatever another
+        availability zone allocated or wrote.  Give each instance a
+        different key: the key is requested from the local
+        <code>ovn-northd</code>, where two transit switches cannot share one.
+        Requires <code>--ic-transit-switch</code>.
+      </dd>
+      <dt><code>--ic-remote-az=<var>name</var></code></dt>
+      <dd>
+        Accept gateways, transit switch ports and routes only from the
+        availability zone <var>name</var>.  Those of any other availability
+        zone in the interconnection databases get no chassis and no port
+        here, and their routes are not learned.
+      </dd>
+    </dl>
+
     <h2>Daemon Options</h2>
     <xi:include href="lib/daemon.xml" xmlns:xi="http://www.w3.org/2003/XInclude"/>
 

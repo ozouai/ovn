@@ -16,6 +16,7 @@
 
 #include <config.h>
 
+#include <ctype.h>
 #include <getopt.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -88,6 +89,49 @@ static const char *ovn_ic_nb_db;
 static const char *ovn_ic_sb_db;
 static const char *unixctl_path;
 
+/* Restrictions on what this ovn-ic serves.  They make it possible to run
+ * several ovn-ic processes against the same NB and SB databases, each with
+ * interconnection databases of its own, when the party on the other side of
+ * each is not trusted: whoever can write to an interconnection database can
+ * otherwise join any transit switch in it, advertise any route onto it and
+ * pick the tunnel key of its datapath.  All of them come from the command
+ * line, so nothing in an interconnection database can change them.
+ *
+ * ic_instance: names this ovn-ic.  It takes the SB lock "ovn_ic_<instance>"
+ *     instead of "ovn_ic", marks the transit switches, remote chassis and
+ *     learned routes it creates with "ic-instance", and leaves alone the ones
+ *     that carry another instance's name (or none).  Without it, ovn-ic owns
+ *     exactly the unmarked ones, as it always did.
+ * ic_transit_switch: the one transit switch served; any other in the IC-NB
+ *     is ignored.
+ * ic_ts_key: the tunnel key that transit switch's datapath must have.
+ * ic_remote_az: the one other availability zone whose gateways, ports and
+ *     routes are accepted. */
+static const char *ic_instance = "";
+static const char *ic_transit_switch;
+static uint32_t ic_ts_key;
+static const char *ic_remote_az;
+
+/* Whether a row with these other_config/external_ids belongs to this
+ * instance. */
+static bool
+ic_owns(const struct smap *ids)
+{
+    return !strcmp(smap_get_def(ids, "ic-instance", ""), ic_instance);
+}
+
+static bool
+ic_serves_ts(const char *ts_name)
+{
+    return !ic_transit_switch || !strcmp(ts_name, ic_transit_switch);
+}
+
+static bool
+ic_accepts_az(const struct icsbrec_availability_zone *remote)
+{
+    return !ic_remote_az || (remote && !strcmp(remote->name, ic_remote_az));
+}
+
 /* SSL/TLS options. */
 static const char *ssl_private_key_file;
 static const char *ssl_certificate_file;
@@ -111,6 +155,12 @@ Options:\n\
   --ic-sb-db=DATABASE       connect to ovn-ic-sb database at DATABASE\n\
                             (default: %s)\n\
   --unixctl=SOCKET          override default control socket name\n\
+  --ic-instance=NAME        name of this ovn-ic among several that serve\n\
+                            the same ovn-nb and ovn-sb databases\n\
+  --ic-transit-switch=NAME  serve only the transit switch NAME\n\
+  --ic-ts-key=KEY           tunnel key of that transit switch's datapath\n\
+  --ic-remote-az=NAME       accept gateways, ports and routes only from\n\
+                            the availability zone NAME\n\
   -h, --help                display this help message\n\
   -o, --options             list available options\n\
   -V, --version             display version information\n\
@@ -226,13 +276,18 @@ ts_run(struct ic_context *ctx)
         /* Get current NB Logical_Switch with other_config:interconn-ts */
         NBREC_LOGICAL_SWITCH_FOR_EACH (ls, ctx->ovnnb_idl) {
             const char *ts_name = smap_get(&ls->other_config, "interconn-ts");
-            if (ts_name) {
+            if (ts_name && ic_owns(&ls->other_config)) {
                 shash_add(&nb_tses, ts_name, ls);
             }
         }
 
         /* Create/update NB Logical_Switch for each TS */
         ICNBREC_TRANSIT_SWITCH_FOR_EACH (ts, ctx->ovninb_idl) {
+            if (!ic_serves_ts(ts->name)) {
+                /* Not ours to serve.  If we created a switch for it before
+                 * being restricted, it is deleted below. */
+                continue;
+            }
             ls = shash_find_and_delete(&nb_tses, ts->name);
             if (!ls) {
                 ls = nbrec_logical_switch_insert(ctx->ovnnb_txn);
@@ -240,6 +295,10 @@ ts_run(struct ic_context *ctx)
                 nbrec_logical_switch_update_other_config_setkey(ls,
                                                                 "interconn-ts",
                                                                 ts->name);
+                if (ic_instance[0]) {
+                    nbrec_logical_switch_update_other_config_setkey(
+                        ls, "ic-instance", ic_instance);
+                }
                 nbrec_logical_switch_update_other_config_setkey(
                         ls, "ic-vxlan_mode", vxlan_mode ? "true" : "false");
             } else {
@@ -286,6 +345,42 @@ ts_run(struct ic_context *ctx)
         /* Create ISB Datapath_Binding */
         ICNBREC_TRANSIT_SWITCH_FOR_EACH (ts, ctx->ovninb_idl) {
             isb_dp = shash_find_and_delete(&isb_dps, ts->name);
+            if (!ic_serves_ts(ts->name)) {
+                /* Somebody else's: neither given a datapath by us nor
+                 * deleted as an extra one below. */
+                continue;
+            }
+            if (ic_ts_key) {
+                /* The key is ours to decide.  Whatever another AZ's ovn-ic
+                 * allocated, or somebody wrote, is replaced: the key is
+                 * requested from our northd, where it must not collide with
+                 * a transit switch served by another instance. */
+                if (isb_dp && isb_dp->tunnel_key == ic_ts_key) {
+                    continue;
+                }
+                if (ovn_tnlid_present(&dp_tnlids, ic_ts_key)) {
+                    if (shash_find(&isb_dps, ts->name)) {
+                        /* A second datapath for this transit switch, made
+                         * at the same moment by another AZ, has the key.
+                         * One of the two is deleted below as an extra. */
+                        continue;
+                    }
+                    static struct vlog_rate_limit rl =
+                        VLOG_RATE_LIMIT_INIT(1, 1);
+                    VLOG_WARN_RL(&rl, "Tunnel key %"PRIu32" for transit "
+                                 "switch %s is used by another datapath in "
+                                 "the IC-SB.", ic_ts_key, ts->name);
+                    continue;
+                }
+                if (!isb_dp) {
+                    isb_dp = icsbrec_datapath_binding_insert(ctx->ovnisb_txn);
+                    icsbrec_datapath_binding_set_transit_switch(isb_dp,
+                                                                ts->name);
+                }
+                icsbrec_datapath_binding_set_tunnel_key(isb_dp, ic_ts_key);
+                ovn_add_tnlid(&dp_tnlids, ic_ts_key);
+                continue;
+            }
             if (!isb_dp) {
                 /* Allocate tunnel key */
                 int64_t dp_key = allocate_ts_dp_key(&dp_tnlids, vxlan_mode);
@@ -358,6 +453,10 @@ sync_isb_gw_to_sb(struct ic_context *ctx,
 {
     sbrec_chassis_set_hostname(chassis, gw->hostname);
     sbrec_chassis_update_other_config_setkey(chassis, "is-remote", "true");
+    if (ic_instance[0]) {
+        sbrec_chassis_update_other_config_setkey(chassis, "ic-instance",
+                                                 ic_instance);
+    }
 
     /* Sync encaps used by this gateway. */
     ovs_assert(gw->n_encaps);
@@ -404,6 +503,9 @@ sync_sb_gw_to_isb(struct ic_context *ctx,
     free(isb_encaps);
 }
 
+static const struct sbrec_chassis *
+find_sb_chassis(struct ic_context *ctx, const char *name);
+
 static void
 gateway_run(struct ic_context *ctx, const struct icsbrec_availability_zone *az)
 {
@@ -417,7 +519,7 @@ gateway_run(struct ic_context *ctx, const struct icsbrec_availability_zone *az)
     ICSBREC_GATEWAY_FOR_EACH (gw, ctx->ovnisb_idl) {
         if (gw->availability_zone == az) {
             shash_add(&local_gws, gw->name, gw);
-        } else {
+        } else if (ic_accepts_az(gw->availability_zone)) {
             shash_add(&remote_gws, gw->name, gw);
         }
     }
@@ -434,7 +536,8 @@ gateway_run(struct ic_context *ctx, const struct icsbrec_availability_zone *az)
             } else if (is_gateway_data_changed(gw, chassis)) {
                 sync_sb_gw_to_isb(ctx, chassis, gw);
             }
-        } else if (smap_get_bool(&chassis->other_config, "is-remote", false)) {
+        } else if (smap_get_bool(&chassis->other_config, "is-remote", false)
+                   && ic_owns(&chassis->other_config)) {
             gw = shash_find_and_delete(&remote_gws, chassis->name);
             if (!gw) {
                 sbrec_chassis_delete(chassis);
@@ -454,6 +557,15 @@ gateway_run(struct ic_context *ctx, const struct icsbrec_availability_zone *az)
     /* Create SB chassis for remote gateways in ISB */
     SHASH_FOR_EACH (node, &remote_gws) {
         gw = node->data;
+        if (find_sb_chassis(ctx, gw->name)) {
+            /* A chassis of ours, or one that another instance learned from
+             * its own interconnection database.  Inserting a second one of
+             * that name would fail every SB transaction from now on. */
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+            VLOG_WARN_RL(&rl, "Gateway %s in the IC-SB is ignored: the SB "
+                         "already has a chassis of that name.", gw->name);
+            continue;
+        }
         chassis = sbrec_chassis_insert(ctx->ovnsb_txn);
         sbrec_chassis_set_name(chassis, gw->name);
         sync_isb_gw_to_sb(ctx, gw, chassis);
@@ -472,7 +584,8 @@ find_ts_in_nb(struct ic_context *ctx, char *ts_name)
     bool found = false;
     NBREC_LOGICAL_SWITCH_FOR_EACH_EQUAL (ls, key, ctx->nbrec_ls_by_name) {
         const char *ls_ts_name = smap_get(&ls->other_config, "interconn-ts");
-        if (ls_ts_name && !strcmp(ts_name, ls_ts_name)) {
+        if (ls_ts_name && !strcmp(ts_name, ls_ts_name)
+            && ic_owns(&ls->other_config)) {
             found = true;
             break;
         }
@@ -835,6 +948,9 @@ port_binding_run(struct ic_context *ctx,
     const struct sbrec_port_binding *sb_pb;
     const struct icnbrec_transit_switch *ts;
     ICNBREC_TRANSIT_SWITCH_FOR_EACH (ts, ctx->ovninb_idl) {
+        if (!ic_serves_ts(ts->name)) {
+            continue;
+        }
         const struct nbrec_logical_switch *ls = find_ts_in_nb(ctx, ts->name);
         if (!ls) {
             VLOG_DBG("Transit switch %s not found in NB.", ts->name);
@@ -853,9 +969,11 @@ port_binding_run(struct ic_context *ctx,
                 shash_add(&local_pbs, isb_pb->logical_port, isb_pb);
                 shash_find_and_delete(&isb_all_local_pbs,
                                       isb_pb->logical_port);
-            } else {
+            } else if (ic_accepts_az(isb_pb->availability_zone)) {
                 shash_add(&remote_pbs, isb_pb->logical_port, isb_pb);
             }
+            /* A port of an AZ that is not accepted gets no remote port
+             * here, and one made for it earlier is removed below. */
             ovn_add_tnlid(&pb_tnlids, isb_pb->tunnel_key);
         }
         icsbrec_port_binding_index_destroy_row(isb_pb_key);
@@ -1552,6 +1670,11 @@ sync_learned_routes(struct ic_context *ctx,
                 continue;
             }
 
+            if (isb_route->availability_zone != az
+                && !ic_accepts_az(isb_route->availability_zone)) {
+                continue;
+            }
+
             const char *isb_route_tag = smap_get(&isb_route->external_ids,
                                                  "ic-route-tag");
             if (isb_route_tag  && !strcmp(isb_route_tag, route_filter_tag)) {
@@ -1623,6 +1746,10 @@ sync_learned_routes(struct ic_context *ctx,
                     nb_route, "ic-learned-route", uuid_s);
                 nbrec_logical_router_static_route_update_options_setkey(
                     nb_route, "origin", isb_route->origin);
+                if (ic_instance[0]) {
+                    nbrec_logical_router_static_route_update_external_ids_setkey(
+                        nb_route, "ic-instance", ic_instance);
+                }
                 free(uuid_s);
                 nbrec_logical_router_update_static_routes_addvalue(ic_lr->lr,
                     nb_route);
@@ -1782,6 +1909,12 @@ build_ts_routes_to_adv(struct ic_context *ctx,
         if (smap_get_uuid(&nb_route->external_ids, "ic-learned-route",
                           &isb_uuid)) {
             /* It is a learned route */
+            if (!ic_owns(&nb_route->external_ids)) {
+                /* Learned by another instance from its interconnection
+                 * databases: not ours to delete, and, like any learned
+                 * route, not advertised. */
+                continue;
+            }
             if (!add_to_routes_learned(&ic_lr->routes_learned, nb_route, lr)) {
                 static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
                 VLOG_WARN_RL(&rl, "Bad format of learned route in NB: "
@@ -2102,6 +2235,10 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
         OVN_DAEMON_OPTION_ENUMS,
         VLOG_OPTION_ENUMS,
         SSL_OPTION_ENUMS,
+        OPT_IC_INSTANCE,
+        OPT_IC_TRANSIT_SWITCH,
+        OPT_IC_TS_KEY,
+        OPT_IC_REMOTE_AZ,
     };
     static const struct option long_options[] = {
         {"ovnsb-db", required_argument, NULL, 'd'},
@@ -2109,6 +2246,11 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
         {"ic-sb-db", required_argument, NULL, 'i'},
         {"ic-nb-db", required_argument, NULL, 'I'},
         {"unixctl", required_argument, NULL, 'u'},
+        {"ic-instance", required_argument, NULL, OPT_IC_INSTANCE},
+        {"ic-transit-switch", required_argument, NULL,
+         OPT_IC_TRANSIT_SWITCH},
+        {"ic-ts-key", required_argument, NULL, OPT_IC_TS_KEY},
+        {"ic-remote-az", required_argument, NULL, OPT_IC_REMOTE_AZ},
         {"help", no_argument, NULL, 'h'},
         {"options", no_argument, NULL, 'o'},
         {"version", no_argument, NULL, 'V'},
@@ -2175,6 +2317,27 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
             unixctl_path = optarg;
             break;
 
+        case OPT_IC_INSTANCE:
+            ic_instance = optarg;
+            break;
+
+        case OPT_IC_TRANSIT_SWITCH:
+            ic_transit_switch = optarg;
+            break;
+
+        case OPT_IC_TS_KEY:
+            if (!str_to_uint(optarg, 10, &ic_ts_key)
+                || ic_ts_key < OVN_MIN_DP_KEY_GLOBAL
+                || ic_ts_key > OVN_MAX_DP_KEY_GLOBAL) {
+                ovs_fatal(0, "--ic-ts-key must be between %u and %u",
+                          OVN_MIN_DP_KEY_GLOBAL, OVN_MAX_DP_KEY_GLOBAL);
+            }
+            break;
+
+        case OPT_IC_REMOTE_AZ:
+            ic_remote_az = optarg;
+            break;
+
         case 'h':
             usage();
             exit(EXIT_SUCCESS);
@@ -2190,6 +2353,11 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
         default:
             break;
         }
+    }
+
+    if (ic_ts_key && !ic_transit_switch) {
+        ovs_fatal(0, "--ic-ts-key needs --ic-transit-switch: one key cannot "
+                  "be given to several transit switches");
     }
 
     if (!ovnsb_db) {
@@ -2463,6 +2631,18 @@ main(int argc, char *argv[])
     unixctl_command_register("ic-sb-connection-status", "", 0, 0,
                              ovn_conn_show, ovnisb_idl_loop.idl);
 
+    /* One active ovn-ic per instance name.  An OVSDB lock name is an <id>
+     * (letters, digits and underscores), which an instance name, typically a
+     * UUID, is not: the server ignores a request for any other name, and
+     * ovn-ic would then wait for its lock forever. */
+    char *lock_name = ic_instance[0] ? xasprintf("ovn_ic_%s", ic_instance)
+                                     : xstrdup("ovn_ic");
+    for (char *c = lock_name; *c; c++) {
+        if (!isalnum((unsigned char) *c)) {
+            *c = '_';
+        }
+    }
+
     /* Main loop. */
     exiting = false;
     state.had_lock = false;
@@ -2484,11 +2664,12 @@ main(int argc, char *argv[])
             if (!ovsdb_idl_has_lock(ovnsb_idl_loop.idl) &&
                 !ovsdb_idl_is_lock_contended(ovnsb_idl_loop.idl))
             {
-                /* Ensure that only a single ovn-ic is active in the deployment
-                 * by acquiring a lock called "ovn_ic" on the southbound
+                /* Ensure that only a single ovn-ic (of this instance name)
+                 * is active in the deployment by acquiring a lock called
+                 * "ovn_ic" (or "ovn_ic_<instance>") on the southbound
                  * database and then only performing DB transactions if the
                  * lock is held. */
-                ovsdb_idl_set_lock(ovnsb_idl_loop.idl, "ovn_ic");
+                ovsdb_idl_set_lock(ovnsb_idl_loop.idl, lock_name);
             }
 
             struct ic_context ctx = {
@@ -2592,6 +2773,7 @@ main(int argc, char *argv[])
         }
     }
 
+    free(lock_name);
     unixctl_server_destroy(unixctl);
     ovsdb_idl_loop_destroy(&ovnnb_idl_loop);
     ovsdb_idl_loop_destroy(&ovnsb_idl_loop);

@@ -3126,3 +3126,266 @@ Route Table <main>:
 OVN_CLEANUP_IC([az1])
 AT_CLEANUP
 ])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn-ic -- restricted to a transit switch and a remote AZ])
+
+ovn_init_ic_db
+net_add n1
+for i in 1 2 3; do
+    ovn_start az$i
+    ovn_as az$i
+    check ovn-nbctl set nb_global . options:ic-route-learn=true \
+        options:ic-route-adv=true
+done
+check ovn-ic-nbctl ts-add ts1
+check ovn-ic-nbctl ts-add ts2
+check ovn-ic-nbctl --wait=sb sync
+OVS_WAIT_UNTIL([ovn_as az1 ovn-nbctl ls-list | grep ts2])
+
+# az1 from now on serves ts1 only, with a tunnel key of its choosing, and
+# accepts nothing but az2.  az3 is the intruder: it shares the interconnection
+# databases, so it can join ts1 and advertise onto it.
+as az1/ic
+OVS_APP_EXIT_AND_WAIT([ovn-ic])
+ovn_as az1
+as az1/ic start_daemon ovn-ic -v \
+    --ovnnb-db=$OVN_NB_DB --ovnsb-db=$OVN_SB_DB \
+    --ic-nb-db=unix:"$ovs_base"/ovn-ic-nb/ovn-ic-nb.sock \
+    --ic-sb-db=unix:"$ovs_base"/ovn-ic-sb/ovn-ic-sb.sock \
+    --ic-transit-switch=ts1 --ic-ts-key=16711999 --ic-remote-az=az2
+
+# The switch it made for ts2 is gone; the other AZs keep theirs, and ts2 keeps
+# its datapath in the IC-SB.
+OVS_WAIT_WHILE([ovn_as az1 ovn-nbctl ls-list | grep ts2])
+OVS_WAIT_UNTIL([test "$(ovn-ic-sbctl --bare --columns tunnel_key find datapath_binding transit_switch=ts1)" = 16711999])
+OVS_WAIT_UNTIL([test "$(ovn_as az1 ovn-nbctl get logical_switch ts1 other_config:requested-tnl-key | tr -d '"')" = 16711999])
+check ovn-ic-nbctl --wait=sb sync
+AT_CHECK([ovn-ic-sbctl --bare --columns transit_switch list datapath_binding | sed '/^$/d' | sort], [0], [dnl
+ts1
+ts2
+])
+AT_CHECK([ovn_as az3 ovn-nbctl ls-list | grep -c ts], [0], [dnl
+2
+])
+
+# Whoever rewrites the key is overruled.
+dp=$(ovn-ic-sbctl --bare --columns _uuid find datapath_binding transit_switch=ts1)
+check ovn-ic-sbctl set datapath_binding $dp tunnel_key=16711700
+OVS_WAIT_UNTIL([test "$(ovn-ic-sbctl --bare --columns tunnel_key find datapath_binding transit_switch=ts1)" = 16711999])
+
+for i in 1 2 3; do
+    ovn_as az$i
+    check ovn-nbctl lr-add lr$i
+    check ovn-nbctl lrp-add lr$i lrp-lr$i-ts1 aa:aa:aa:aa:aa:0$i 169.254.100.$i/24
+    check ovn-nbctl lsp-add-router-port ts1 lsp-ts1-lr$i lrp-lr$i-ts1
+    check ovn-nbctl lr-route-add lr$i 10.11.$i.0/24 169.254.0.1
+done
+for i in 2 3; do
+    sim_add gw$i
+    as gw$i
+    check ovs-vsctl add-br br-phys
+    ovn_az_attach az$i n1 br-phys 192.168.0.$i
+    check ovs-vsctl set open . external-ids:ovn-is-interconn=true
+done
+
+# az2, unrestricted, sees everything az3 put there...
+OVS_WAIT_UNTIL([ovn_as az2 ovn-nbctl lr-route-list lr2 | grep 10.11.3.0])
+OVS_WAIT_UNTIL([ovn_as az2 ovn-sbctl show | grep gw3])
+OVS_WAIT_UNTIL([ovn_as az2 ovn-nbctl lsp-list ts1 | grep lsp-ts1-lr3])
+# ...and az1 only what az2 did.
+OVS_WAIT_UNTIL([ovn_as az1 ovn-nbctl lr-route-list lr1 | grep learned])
+OVS_WAIT_UNTIL([ovn_as az1 ovn-sbctl show | grep gw2])
+check ovn-ic-nbctl --wait=sb sync
+AT_CHECK([ovn_as az1 ovn-nbctl lr-route-list lr1], [0], [dnl
+IPv4 Routes
+Route Table <main>:
+             10.11.1.0/24               169.254.0.1 dst-ip
+             10.11.2.0/24             169.254.100.2 dst-ip (learned)
+])
+AT_CHECK([ovn_as az1 ovn-nbctl --bare --columns name find logical_switch_port type=remote], [0], [dnl
+lsp-ts1-lr2
+])
+AT_CHECK([ovn_as az1 ovn-sbctl --bare --columns name find chassis other_config:is-remote=true], [0], [dnl
+gw2
+])
+# az1 still advertises.
+AT_CHECK([ovn_as az3 ovn-nbctl lr-route-list lr3 | grep -c 10.11.1.0], [0], [dnl
+1
+])
+
+OVN_CLEANUP_SBOX(gw2)
+OVN_CLEANUP_SBOX(gw3)
+OVN_CLEANUP_IC([az1], [az2], [az3])
+
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn-ic -- two instances with interconnection databases of their own])
+
+# az1 is interconnected with az2 through one pair of interconnection
+# databases and with az3 through another; az2 and az3 cannot see each other.
+ovn_init_ic_db
+mkdir "$ovs_base"/ic2
+# The second pair is one ovsdb-server holding both databases.
+check as ic2 ovsdb-tool create "$ovs_base"/ic2/ovn-ic-nb.db "$abs_top_srcdir"/ovn-ic-nb.ovsschema
+check as ic2 ovsdb-tool create "$ovs_base"/ic2/ovn-ic-sb.db "$abs_top_srcdir"/ovn-ic-sb.ovsschema
+as ic2 start_daemon ovsdb-server --remote=punix:"$ovs_base"/ic2/ic.sock \
+    "$ovs_base"/ic2/ovn-ic-nb.db "$ovs_base"/ic2/ovn-ic-sb.db
+IC1_NB=unix:"$ovs_base"/ovn-ic-nb/ovn-ic-nb.sock
+IC1_SB=unix:"$ovs_base"/ovn-ic-sb/ovn-ic-sb.sock
+IC2=unix:"$ovs_base"/ic2/ic.sock
+
+net_add n1
+for i in 1 2 3; do
+    ovn_start az$i
+    ovn_as az$i
+    check ovn-nbctl set nb_global . options:ic-route-learn=true \
+        options:ic-route-adv=true
+    as az$i/ic
+    OVS_APP_EXIT_AND_WAIT([ovn-ic])
+done
+
+ovn_as az1
+as az1/ic start_daemon ovn-ic -v \
+    --ovnnb-db=$OVN_NB_DB --ovnsb-db=$OVN_SB_DB \
+    --ic-nb-db=$IC1_NB --ic-sb-db=$IC1_SB \
+    --ic-instance=cluster-a --ic-transit-switch=tsa --ic-ts-key=16711901 \
+    --ic-remote-az=az2
+mkdir "$ovs_base"/az1/ic-b
+as az1/ic-b start_daemon ovn-ic -v \
+    --ovnnb-db=$OVN_NB_DB --ovnsb-db=$OVN_SB_DB \
+    --ic-nb-db=$IC2 --ic-sb-db=$IC2 \
+    --ic-instance=cluster-b --ic-transit-switch=tsb --ic-ts-key=16711902 \
+    --ic-remote-az=az3
+ovn_as az2
+as az2/ic start_daemon ovn-ic -v \
+    --ovnnb-db=$OVN_NB_DB --ovnsb-db=$OVN_SB_DB \
+    --ic-nb-db=$IC1_NB --ic-sb-db=$IC1_SB
+ovn_as az3
+as az3/ic start_daemon ovn-ic -v \
+    --ovnnb-db=$OVN_NB_DB --ovnsb-db=$OVN_SB_DB \
+    --ic-nb-db=$IC2 --ic-sb-db=$IC2
+
+# Both of az1's are active: they do not share a lock.  (The names have a
+# dash, which a lock name cannot: an instance is usually named by a UUID.)
+OVS_WAIT_UNTIL([as az1/ic ovn-appctl -t ovn-ic status | grep active])
+OVS_WAIT_UNTIL([as az1/ic-b ovn-appctl -t ovn-ic status | grep active])
+
+check ovn-ic-nbctl --db=$IC1_NB ts-add tsa
+check ovn-ic-nbctl --db=$IC2 ts-add tsb
+
+OVS_WAIT_UNTIL([test "$(ovn_as az1 ovn-nbctl get logical_switch tsa other_config:ic-instance | tr -d '"')" = cluster-a])
+OVS_WAIT_UNTIL([test "$(ovn_as az1 ovn-nbctl get logical_switch tsb other_config:ic-instance | tr -d '"')" = cluster-b])
+OVS_WAIT_UNTIL([test "$(ovn_as az1 ovn-nbctl get logical_switch tsa other_config:requested-tnl-key | tr -d '"')" = 16711901])
+OVS_WAIT_UNTIL([test "$(ovn_as az1 ovn-nbctl get logical_switch tsb other_config:requested-tnl-key | tr -d '"')" = 16711902])
+OVS_WAIT_UNTIL([ovn_as az2 ovn-nbctl ls-list | grep tsa])
+OVS_WAIT_UNTIL([ovn_as az3 ovn-nbctl ls-list | grep tsb])
+
+# One router of az1 on both transit switches.
+ovn_as az1
+check ovn-nbctl lr-add lr1
+check ovn-nbctl lrp-add lr1 lrp-lr1-tsa aa:aa:aa:aa:aa:01 169.254.100.1/24
+check ovn-nbctl lsp-add-router-port tsa lsp-tsa-lr1 lrp-lr1-tsa
+check ovn-nbctl lrp-add lr1 lrp-lr1-tsb aa:aa:aa:aa:bb:01 169.254.101.1/24
+check ovn-nbctl lsp-add-router-port tsb lsp-tsb-lr1 lrp-lr1-tsb
+check ovn-nbctl lr-route-add lr1 10.11.1.0/24 169.254.0.1
+ovn_as az2
+check ovn-nbctl lr-add lr2
+check ovn-nbctl lrp-add lr2 lrp-lr2-tsa aa:aa:aa:aa:aa:02 169.254.100.2/24
+check ovn-nbctl lsp-add-router-port tsa lsp-tsa-lr2 lrp-lr2-tsa
+check ovn-nbctl lr-route-add lr2 10.11.2.0/24 169.254.0.1
+ovn_as az3
+check ovn-nbctl lr-add lr3
+check ovn-nbctl lrp-add lr3 lrp-lr3-tsb aa:aa:aa:aa:bb:03 169.254.101.3/24
+check ovn-nbctl lsp-add-router-port tsb lsp-tsb-lr3 lrp-lr3-tsb
+check ovn-nbctl lr-route-add lr3 10.11.3.0/24 169.254.0.1
+for i in 2 3; do
+    sim_add gw$i
+    as gw$i
+    check ovs-vsctl add-br br-phys
+    ovn_az_attach az$i n1 br-phys 192.168.0.$i
+    check ovs-vsctl set open . external-ids:ovn-is-interconn=true
+done
+
+OVS_WAIT_UNTIL([ovn_as az1 ovn-nbctl lr-route-list lr1 | grep 10.11.2.0])
+OVS_WAIT_UNTIL([ovn_as az1 ovn-nbctl lr-route-list lr1 | grep 10.11.3.0])
+OVS_WAIT_UNTIL([ovn_as az1 ovn-sbctl show | grep gw2])
+OVS_WAIT_UNTIL([ovn_as az1 ovn-sbctl show | grep gw3])
+OVS_WAIT_UNTIL([ovn_as az2 ovn-nbctl lr-route-list lr2 | grep learned])
+OVS_WAIT_UNTIL([ovn_as az3 ovn-nbctl lr-route-list lr3 | grep learned])
+
+# What each instance made carries its name...
+snapshot() {
+    ovn_as az1 ovn-nbctl --bare --columns _uuid,ip_prefix,nexthop,external_ids list logical_router_static_route | sed '/^$/d' | sort
+    ovn_as az1 ovn-nbctl --bare --columns _uuid,name find logical_switch_port type=remote | sed '/^$/d' | sort
+    ovn_as az1 ovn-nbctl --bare --columns _uuid,name find logical_switch other_config:interconn-ts!=none | sed '/^$/d' | sort
+    ovn_as az1 ovn-sbctl --bare --columns _uuid,name,other_config find chassis other_config:is-remote=true | sed '/^$/d' | sort
+}
+snapshot > before
+AT_CHECK([ovn_as az1 ovn-nbctl --bare --columns ip_prefix find logical_router_static_route external_ids:ic-instance=cluster-a], [0], [dnl
+10.11.2.0/24
+])
+AT_CHECK([ovn_as az1 ovn-nbctl --bare --columns ip_prefix find logical_router_static_route external_ids:ic-instance=cluster-b], [0], [dnl
+10.11.3.0/24
+])
+AT_CHECK([ovn_as az1 ovn-sbctl --bare --columns name find chassis other_config:ic-instance=cluster-a], [0], [dnl
+gw2
+])
+AT_CHECK([ovn_as az1 ovn-sbctl --bare --columns name find chassis other_config:ic-instance=cluster-b], [0], [dnl
+gw3
+])
+# ...and neither undoes the other's work: after both have run again, every
+# row is the one that was there before.
+ovn_as az1
+check ovn-nbctl lr-route-add lr1 10.11.9.0/24 169.254.0.1
+OVS_WAIT_UNTIL([ovn_as az2 ovn-nbctl lr-route-list lr2 | grep 10.11.9.0])
+OVS_WAIT_UNTIL([ovn_as az3 ovn-nbctl lr-route-list lr3 | grep 10.11.9.0])
+check ovn-nbctl lr-route-del lr1 10.11.9.0/24
+OVS_WAIT_WHILE([ovn_as az2 ovn-nbctl lr-route-list lr2 | grep 10.11.9.0])
+OVS_WAIT_WHILE([ovn_as az3 ovn-nbctl lr-route-list lr3 | grep 10.11.9.0])
+snapshot > after
+AT_CHECK([diff before after])
+
+# The AZs on the two sides learn az1's routes and not each other's: what az1
+# learned through one instance is not advertised through the other.
+AT_CHECK([ovn_as az2 ovn-nbctl lr-route-list lr2 | grep learned | sed 's/  */ /g'], [0], [dnl
+ 10.11.1.0/24 169.254.100.1 dst-ip (learned)
+])
+AT_CHECK([ovn_as az3 ovn-nbctl lr-route-list lr3 | grep learned | sed 's/  */ /g'], [0], [dnl
+ 10.11.1.0/24 169.254.101.1 dst-ip (learned)
+])
+AT_CHECK([ovn_as az2 ovn-nbctl ls-list | grep -c tsb], [1], [dnl
+0
+])
+
+# A withdrawal on one side takes away that side's route only.
+ovn_as az3
+check ovn-nbctl lr-route-del lr3 10.11.3.0/24
+OVS_WAIT_WHILE([ovn_as az1 ovn-nbctl lr-route-list lr1 | grep 10.11.3.0])
+AT_CHECK([ovn_as az1 ovn-nbctl lr-route-list lr1 | grep -c 10.11.2.0], [0], [dnl
+1
+])
+
+# With instance b stopped, what it made stays until it is back.
+as az1/ic-b
+OVS_APP_EXIT_AND_WAIT([ovn-ic])
+ovn_as az2
+check ovn-nbctl lr-route-add lr2 10.11.22.0/24 169.254.0.1
+OVS_WAIT_UNTIL([ovn_as az1 ovn-nbctl lr-route-list lr1 | grep 10.11.22.0])
+AT_CHECK([ovn_as az1 ovn-nbctl ls-list | grep -c tsb], [0], [dnl
+1
+])
+AT_CHECK([ovn_as az1 ovn-sbctl --bare --columns name find chassis other_config:ic-instance=cluster-b], [0], [dnl
+gw3
+])
+
+as ic2
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+OVN_CLEANUP_SBOX(gw2)
+OVN_CLEANUP_SBOX(gw3)
+OVN_CLEANUP_IC([az1], [az2], [az3])
+
+AT_CLEANUP
+])
